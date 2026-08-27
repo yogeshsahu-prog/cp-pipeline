@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
 CP Pendency pipeline — Gmail -> parse .xlsb -> aggregate -> Drive agg.json
-Runs headless on GitHub Actions. Authenticates as the user via a stored OAuth
-refresh token (scopes: gmail.readonly + drive). Idempotent: skips if the newest
-matching email hasn't changed since the last run.
+DIAGNOSTIC VERSION — prints the query, match count, and every candidate
+message's subject/date so we can see exactly what Gmail is returning.
 """
 import os, io, json, base64, datetime as dt
 import pandas as pd
@@ -28,24 +27,27 @@ def creds():
     )
 
 def latest_attachment(gmail, query):
-    """Return (msg_id, filename, bytes) for the newest matching xlsb, or None.
-    list() order isn't reliably newest-first, so we explicitly compare each
-    candidate's internalDate (server receive time, ms since epoch) and pick
-    the max — not just msgs[0]."""
+    """Return (msg_id, filename, bytes) for the newest matching xlsb, or None."""
+    print(f"DEBUG: query received = {query!r}")
     res = gmail.users().messages().list(userId="me", q=query, maxResults=10).execute()
     msgs = res.get("messages", [])
+    print(f"DEBUG: {len(msgs)} messages matched")
     if not msgs:
         return None
 
     best_id, best_ts = None, -1
     for m in msgs:
         meta = gmail.users().messages().get(
-            userId="me", id=m["id"], format="metadata").execute()
+            userId="me", id=m["id"], format="metadata",
+            metadataHeaders=["Subject", "Date"]).execute()
         ts = int(meta.get("internalDate", 0))
+        hdrs = {h["name"]: h["value"] for h in meta.get("payload", {}).get("headers", [])}
+        print(f"DEBUG: id={m['id']} ts={ts} subject={hdrs.get('Subject','?')!r} date={hdrs.get('Date','?')!r}")
         if ts > best_ts:
             best_ts, best_id = ts, m["id"]
 
     msg_id = best_id
+    print(f"DEBUG: picked id={msg_id}")
     full = gmail.users().messages().get(userId="me", id=msg_id, format="full").execute()
 
     def walk(parts):
@@ -82,8 +84,6 @@ def write_json(drive, file_id, obj):
 REQUIRED_COLS = {"Bucket", "DC Hub Zone", "destination_state", "DC", "Status"}
 
 def pick_data_sheet(xlsb_bytes):
-    """The data tab is dated (e.g. 'CP XB Aug 27-29'), so find it by its columns,
-    not its name — whichever sheet carries the expected headers."""
     xl = pd.ExcelFile(io.BytesIO(xlsb_bytes), engine="pyxlsb")
     for name in xl.sheet_names:
         head = pd.read_excel(xl, sheet_name=name, engine="pyxlsb", nrows=0)
@@ -101,7 +101,7 @@ def aggregate(xlsb_bytes, snapshot_label):
     for c in (Z, S, H):
         op[c] = op[c].astype(str).replace("nan", "Unknown").fillna("Unknown")
     op["cp"] = pd.to_numeric(op["customer_promise_date"], errors="coerce")
-    today = pd.to_numeric(op["cp"], errors="coerce").min()   # earliest promise = "due first"
+    today = pd.to_numeric(op["cp"], errors="coerce").min()
 
     def m(g):
         st = g["Status"].value_counts()
