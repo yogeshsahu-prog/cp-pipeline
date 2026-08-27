@@ -28,12 +28,24 @@ def creds():
     )
 
 def latest_attachment(gmail, query):
-    """Return (msg_id, filename, bytes) for the newest matching xlsb, or None."""
-    res = gmail.users().messages().list(userId="me", q=query, maxResults=5).execute()
+    """Return (msg_id, filename, bytes) for the newest matching xlsb, or None.
+    list() order isn't reliably newest-first, so we explicitly compare each
+    candidate's internalDate (server receive time, ms since epoch) and pick
+    the max — not just msgs[0]."""
+    res = gmail.users().messages().list(userId="me", q=query, maxResults=10).execute()
     msgs = res.get("messages", [])
     if not msgs:
         return None
-    msg_id = msgs[0]["id"]                      # Gmail returns newest first
+
+    best_id, best_ts = None, -1
+    for m in msgs:
+        meta = gmail.users().messages().get(
+            userId="me", id=m["id"], format="metadata").execute()
+        ts = int(meta.get("internalDate", 0))
+        if ts > best_ts:
+            best_ts, best_id = ts, m["id"]
+
+    msg_id = best_id
     full = gmail.users().messages().get(userId="me", id=msg_id, format="full").execute()
 
     def walk(parts):
