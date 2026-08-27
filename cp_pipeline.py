@@ -49,19 +49,20 @@ def latest_attachment(gmail, query):
         candidates.append((ts, m["id"]))
     candidates.sort(key=lambda x: -x[0])   # newest first
 
-    def walk(parts):
-        for p in parts or []:
-            fn = p.get("filename", "")
-            if fn.lower().endswith(".xlsb") and p.get("body", {}).get("attachmentId"):
-                return p["body"]["attachmentId"], fn
-            sub = walk(p.get("parts"))
+    def walk(payload):
+        # Check this node itself first (handles flat, non-multipart messages)
+        fn = payload.get("filename", "")
+        if fn.lower().endswith(".xlsb") and payload.get("body", {}).get("attachmentId"):
+            return payload["body"]["attachmentId"], fn
+        for p in payload.get("parts") or []:
+            sub = walk(p)
             if sub:
                 return sub
         return None
 
     for ts, msg_id in candidates:
         full = gmail.users().messages().get(userId="me", id=msg_id, format="full").execute()
-        hit = walk(full["payload"].get("parts"))
+        hit = walk(full["payload"])
         if hit:
             print(f"DEBUG: picked id={msg_id} (has .xlsb)")
             att_id, fn = hit
