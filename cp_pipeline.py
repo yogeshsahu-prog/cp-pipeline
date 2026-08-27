@@ -1,345 +1,170 @@
-import os
-import json
-import base64
-import io
-import datetime
-from datetime import datetime
+#!/usr/bin/env python3
+"""
+CP Pendency pipeline — Gmail -> parse .xlsb -> aggregate -> Drive agg.json
+Runs headless on GitHub Actions. Authenticates as the user via a stored OAuth
+refresh token (scopes: gmail.readonly + drive). Idempotent: skips if the newest
+matching email hasn't changed since the last run.
+"""
+import os, io, json, base64, datetime as dt
+import pandas as pd
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-from google.auth.transport.requests import Request
-import pandas as pd
-import email.utils
-import time
+from googleapiclient.http import MediaIoBaseUpload
 
-SCOPES = [
-    'https://www.googleapis.com/auth/gmail.readonly',
-    'https://www.googleapis.com/auth/drive.file'
-]
+SCOPES = ["https://www.googleapis.com/auth/gmail.readonly",
+          "https://www.googleapis.com/auth/drive",
+          "https://www.googleapis.com/auth/spreadsheets"]
 
-def get_gmail_service():
-    """Authenticate and return Gmail service"""
-    creds = Credentials(
-        token=None,
-        refresh_token=os.environ.get('GOOGLE_REFRESH_TOKEN'),
-        client_id=os.environ.get('GOOGLE_CLIENT_ID'),
-        client_secret=os.environ.get('GOOGLE_CLIENT_SECRET'),
-        token_uri='https://oauth2.googleapis.com/token',
-        scopes=SCOPES
+PROBLEM_PINS = {"System Deactivated", "Embargo", "COD OFF"}
+
+def creds():
+    return Credentials(
+        None,
+        refresh_token=os.environ["GOOGLE_REFRESH_TOKEN"],
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=os.environ["GOOGLE_CLIENT_ID"],
+        client_secret=os.environ["GOOGLE_CLIENT_SECRET"],
+        scopes=SCOPES,
     )
-    creds.refresh(Request())
-    return build('gmail', 'v1', credentials=creds)
 
-def get_drive_service():
-    """Authenticate and return Drive service"""
-    creds = Credentials(
-        token=None,
-        refresh_token=os.environ.get('GOOGLE_REFRESH_TOKEN'),
-        client_id=os.environ.get('GOOGLE_CLIENT_ID'),
-        client_secret=os.environ.get('GOOGLE_CLIENT_SECRET'),
-        token_uri='https://oauth2.googleapis.com/token',
-        scopes=SCOPES
-    )
-    creds.refresh(Request())
-    return build('drive', 'v3', credentials=creds)
+def latest_attachment(gmail, query):
+    """Return (msg_id, filename, bytes) for the newest matching xlsb, or None."""
+    res = gmail.users().messages().list(userId="me", q=query, maxResults=5).execute()
+    msgs = res.get("messages", [])
+    if not msgs:
+        return None
+    msg_id = msgs[0]["id"]                      # Gmail returns newest first
+    full = gmail.users().messages().get(userId="me", id=msg_id, format="full").execute()
 
-def get_newest_email(service, query):
-    """Get the absolute newest email by parsing the Date header"""
-    try:
-        # Get up to 10 emails matching the query
-        result = service.users().messages().list(
-            userId='me',
-            q=query,
-            maxResults=10  # Get more to compare dates
-        ).execute()
-        
-        messages = result.get('messages', [])
-        if not messages:
-            print("❌ No emails found")
-            return None
-        
-        print(f"🔍 Found {len(messages)} emails, finding newest...")
-        
-        # Get full details for each email and compare dates
-        newest_msg = None
-        newest_date = None
-        
-        for msg_ref in messages:
-            msg = service.users().messages().get(
-                userId='me',
-                id=msg_ref['id'],
-                format='metadata',
-                metadataHeaders=['Date']
-            ).execute()
-            
-            # Extract the Date header
-            headers = msg.get('payload', {}).get('headers', [])
-            for h in headers:
-                if h['name'] == 'Date':
-                    date_str = h['value']
-                    # Parse the date
-                    try:
-                        # Parse RFC 2822 date
-                        parsed_date = email.utils.parsedate_to_datetime(date_str)
-                        print(f"📧 Found: {parsed_date.strftime('%Y-%m-%d %H:%M:%S')} - {msg['id'][:10]}...")
-                        
-                        if newest_date is None or parsed_date > newest_date:
-                            newest_date = parsed_date
-                            newest_msg = msg
-                    except:
-                        # If parsing fails, just use the raw string
-                        print(f"📧 Found: {date_str}")
-                        if newest_date is None:
-                            newest_date = date_str
-                            newest_msg = msg
-                    break
-        
-        if newest_msg:
-            print(f"✅ Selected newest email from: {newest_date}")
-            # Now get the full message with all parts
-            full_msg = service.users().messages().get(
-                userId='me',
-                id=newest_msg['id'],
-                format='full'
-            ).execute()
-            return full_msg
-        else:
-            print("❌ Could not determine newest email")
-            return None
-            
-    except Exception as e:
-        print(f"❌ Error: {e}")
-        import traceback
-        traceback.print_exc()
+    def walk(parts):
+        for p in parts or []:
+            fn = p.get("filename", "")
+            if fn.lower().endswith(".xlsb") and p.get("body", {}).get("attachmentId"):
+                return p["body"]["attachmentId"], fn
+            sub = walk(p.get("parts"))
+            if sub:
+                return sub
         return None
 
-def get_attachment(service, msg):
-    """Download the .xlsb attachment"""
-    try:
-        parts = msg.get('payload', {}).get('parts', [])
-        
-        def find_attachment(parts):
-            for part in parts:
-                if 'parts' in part:
-                    result = find_attachment(part['parts'])
-                    if result:
-                        return result
-                if part.get('filename') and '.xlsb' in part['filename'].lower():
-                    return part
-            return None
-        
-        attachment = find_attachment(parts)
-        if not attachment:
-            print("❌ No .xlsb attachment found")
-            return None
-        
-        filename = attachment['filename']
-        
-        if 'data' in attachment['body']:
-            data = base64.urlsafe_b64decode(attachment['body']['data'])
-        elif 'attachmentId' in attachment['body']:
-            att = service.users().messages().attachments().get(
-                userId='me',
-                messageId=msg['id'],
-                id=attachment['body']['attachmentId']
-            ).execute()
-            data = base64.urlsafe_b64decode(att['data'])
-        else:
-            return None
-        
-        print(f"📎 Downloaded: {filename}")
-        return data, filename
-        
-    except Exception as e:
-        print(f"❌ Error downloading attachment: {e}")
+    hit = walk(full["payload"].get("parts"))
+    if not hit:
         return None
+    att_id, fn = hit
+    att = gmail.users().messages().attachments().get(
+        userId="me", messageId=msg_id, id=att_id).execute()
+    data = base64.urlsafe_b64decode(att["data"])
+    return msg_id, fn, data
 
-def parse_excel(data, filename):
-    """Extract the numbers from the Excel file"""
+def read_state(drive, file_id):
     try:
-        df = pd.read_excel(io.BytesIO(data), sheet_name=0)
-        print(f"📊 Excel has {len(df)} rows and {len(df.columns)} columns")
-        
-        # Find the "Current Open" row
-        current_open_row = None
-        for idx, row in df.iterrows():
-            row_str = ' '.join(str(v).lower() for v in row.values if pd.notna(v))
-            if 'current open' in row_str:
-                current_open_row = idx
-                print(f"🔍 Found 'Current Open' at row {idx}")
-                break
-        
-        if current_open_row is None:
-            print("❌ Could not find 'Current Open'")
-            return None
-        
-        # Get the row
-        row = df.iloc[current_open_row]
-        
-        # Extract numeric values
-        values = []
-        for v in row:
-            if pd.notna(v) and isinstance(v, (int, float)):
-                values.append(int(v))
-        
-        print(f"📊 Found numeric values: {values}")
-        
-        if len(values) < 3:
-            print(f"❌ Expected 3+ values, got {len(values)}")
-            return None
-        
-        today = values[0]
-        tomorrow = values[1] if len(values) > 1 else 0
-        day_after = values[2] if len(values) > 2 else 0
-        
-        total_open = today + tomorrow + day_after
-        
-        # Find RAD, Intransit, Misroute
-        rad = 0
-        it = 0
-        mis = 0
-        noplan = 0
-        badpin = 0
-        cod = 0
-        
-        for idx, row in df.iterrows():
-            row_str = ' '.join(str(v).lower() for v in row.values if pd.notna(v))
-            row_vals = [int(v) for v in row if pd.notna(v) and isinstance(v, (int, float))]
-            
-            if 'rad' in row_str and not row_vals:
-                continue
-            elif 'rad' in row_str:
-                rad = row_vals[0] if row_vals else 0
-                print(f"🔍 Found RAD: {rad}")
-            elif 'intransit' in row_str:
-                it = row_vals[0] if row_vals else 0
-                print(f"🔍 Found Intransit: {it}")
-            elif 'misroute' in row_str:
-                mis = row_vals[0] if row_vals else 0
-                print(f"🔍 Found Misroute: {mis}")
-            elif 'not manifested' in row_str or 'no plan' in row_str:
-                noplan = row_vals[0] if row_vals else 0
-                print(f"🔍 Found No Plan: {noplan}")
-            elif 'badpin' in row_str or 'bad pin' in row_str:
-                badpin = row_vals[0] if row_vals else 0
-                print(f"🔍 Found Badpin: {badpin}")
-            elif 'cod' in row_str and len(row_str) < 10:  # Avoid false matches
-                cod = row_vals[0] if row_vals else 0
-                print(f"🔍 Found COD: {cod}")
-        
-        result = {
-            'meta': {
-                'snapshot': filename.replace('.xlsb', ''),
-                'open': total_open,
-                'hubs': 0,
-                'states': 0,
-                'zones': 0,
-                'updated': datetime.now().strftime('%d %b, %I:%M %p IST')
-            },
-            'overall': {
-                'total': total_open,
-                'rad': rad,
-                'it': it,
-                'mis': mis,
-                'today': today,
-                'tom': tomorrow,
-                'd2': day_after,
-                'noplan': noplan,
-                'badpin': badpin,
-                'cod': cod
-            },
-            'zones': []
-        }
-        
-        print(f"✅ Parsed: Today={today}, Tomorrow={tomorrow}, DayAfter={day_after}")
-        print(f"✅ Total Open = {total_open}")
-        print(f"✅ RAD={rad}, Intransit={it}, Misroute={mis}")
-        return result
-        
-    except Exception as e:
-        print(f"❌ Error parsing: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
+        buf = io.BytesIO(drive.files().get_media(fileId=file_id).execute())
+        return json.loads(buf.getvalue().decode() or "{}")
+    except Exception:
+        return {}
 
-def update_drive(service, file_id, data):
-    """Update the Drive file"""
-    try:
-        from googleapiclient.http import MediaIoBaseUpload
-        
-        json_str = json.dumps(data, indent=2)
-        media = MediaIoBaseUpload(
-            io.BytesIO(json_str.encode('utf-8')),
-            mimetype='application/json'
+def write_json(drive, file_id, obj):
+    body = io.BytesIO(json.dumps(obj, separators=(",", ":")).encode())
+    media = MediaIoBaseUpload(body, mimetype="application/json", resumable=False)
+    drive.files().update(fileId=file_id, media_body=media).execute()
+
+REQUIRED_COLS = {"Bucket", "DC Hub Zone", "destination_state", "DC", "Status"}
+
+def pick_data_sheet(xlsb_bytes):
+    """The data tab is dated (e.g. 'CP XB Aug 27-29'), so find it by its columns,
+    not its name — whichever sheet carries the expected headers."""
+    xl = pd.ExcelFile(io.BytesIO(xlsb_bytes), engine="pyxlsb")
+    for name in xl.sheet_names:
+        head = pd.read_excel(xl, sheet_name=name, engine="pyxlsb", nrows=0)
+        cols = {str(c).strip() for c in head.columns}
+        if REQUIRED_COLS.issubset(cols):
+            return name
+    raise ValueError(f"No data sheet with expected columns in {xl.sheet_names}")
+
+def aggregate(xlsb_bytes, snapshot_label):
+    sheet = pick_data_sheet(xlsb_bytes)
+    df = pd.read_excel(io.BytesIO(xlsb_bytes), sheet_name=sheet, engine="pyxlsb")
+    df.columns = [str(c).strip() for c in df.columns]
+    op = df[df["Bucket"] == "Current Open"].copy()
+    Z, S, H = "DC Hub Zone", "destination_state", "DC"
+    for c in (Z, S, H):
+        op[c] = op[c].astype(str).replace("nan", "Unknown").fillna("Unknown")
+    op["cp"] = pd.to_numeric(op["customer_promise_date"], errors="coerce")
+    today = pd.to_numeric(op["cp"], errors="coerce").min()   # earliest promise = "due first"
+
+    def m(g):
+        st = g["Status"].value_counts()
+        cp = g["cp"]
+        return dict(
+            total=int(len(g)),
+            rad=int(st.get("RAD", 0)),
+            it=int(st.get("Intransit", 0)),
+            mis=int(st.get("Misroute_IT", 0) + st.get("Investigate", 0)),
+            today=int((cp <= today).sum()),
+            tom=int((cp == today + 1).sum()),
+            d2=int((cp >= today + 2).sum()),
+            noplan=int((g["2167 Pins"] == "No Plan").sum()),
+            badpin=int(g["Pincode"].isin(PROBLEM_PINS).sum()),
+            cod=int((g["Order Type"] == "COD").sum()),
         )
-        
-        service.files().update(
-            fileId=file_id,
-            media_body=media
-        ).execute()
-        
-        print(f"✅ Updated Drive file: {file_id}")
-        return True
-        
-    except Exception as e:
-        print(f"❌ Error updating: {e}")
-        return False
+
+    zones = []
+    for z, gz in op.groupby(Z):
+        zd = m(gz); zd["name"] = z; sts = []
+        for s, gs in gz.groupby(S):
+            sd = m(gs); sd["name"] = s
+            sd["hubs"] = sorted([dict(m(gh), name=h) for h, gh in gs.groupby(H)],
+                                key=lambda x: -x["total"])
+            sts.append(sd)
+        zd["states"] = sorted(sts, key=lambda x: -x["total"]); zones.append(zd)
+
+    return dict(
+        meta=dict(snapshot=snapshot_label, open=int(len(op)),
+                  hubs=int(op[H].nunique()), states=int(op[S].nunique()),
+                  zones=int(op[Z].nunique()),
+                  updated=dt.datetime.now(dt.timezone.utc)
+                          .astimezone(dt.timezone(dt.timedelta(hours=5, minutes=30)))
+                          .strftime("%d %b, %I:%M %p IST")),
+        overall=m(op),
+        zones=sorted(zones, key=lambda x: -x["total"]),
+    )
+
+def append_trend(sheets, sheet_id, agg):
+    o = agg["overall"]
+    row = [[agg["meta"]["updated"], o["total"], o["rad"], o["it"] + o["mis"],
+            o["today"], o["noplan"], o["badpin"]]]
+    sheets.spreadsheets().values().append(
+        spreadsheetId=sheet_id, range="Trend!A1",
+        valueInputOption="USER_ENTERED", insertDataOption="INSERT_ROWS",
+        body={"values": row}).execute()
 
 def main():
-    print("🚀 Starting CP Pipeline...")
-    
-    # Get environment variables
-    query = os.environ.get('GMAIL_QUERY', 'subject:"Flipkart CP Update" has:attachment filename:xlsb')
-    agg_id = os.environ.get('DRIVE_AGG_FILE_ID')
-    state_id = os.environ.get('DRIVE_STATE_FILE_ID')
-    
-    print(f"🔍 Query: {query}")
-    
-    try:
-        # Authenticate
-        gmail = get_gmail_service()
-        drive = get_drive_service()
-        print("✅ Authentication successful")
-        
-        # Get NEWEST email
-        msg = get_newest_email(gmail, query)
-        if not msg:
-            print("❌ No email found")
-            return
-        
-        # Download attachment
-        attachment = get_attachment(gmail, msg)
-        if not attachment:
-            print("❌ No attachment found")
-            return
-        
-        data, filename = attachment
-        
-        # Parse data
-        parsed = parse_excel(data, filename)
-        if not parsed:
-            print("❌ Failed to parse")
-            return
-        
-        # Update Drive
-        if update_drive(drive, agg_id, parsed):
-            print(f"✅ Success! Updated with {filename}")
-            
-            # Update state
-            if state_id:
-                state = {
-                    'last_msg_id': msg['id'],
-                    'file': filename,
-                    'open': parsed['meta']['open'],
-                    'updated': datetime.now().isoformat()
-                }
-                update_drive(drive, state_id, state)
-        else:
-            print("❌ Failed to update Drive")
-            
-    except Exception as e:
-        print(f"❌ Error: {e}")
-        import traceback
-        traceback.print_exc()
+    c = creds()
+    gmail = build("gmail", "v1", credentials=c, cache_discovery=False)
+    drive = build("drive", "v3", credentials=c, cache_discovery=False)
 
-if __name__ == '__main__':
+    hit = latest_attachment(gmail, os.environ["GMAIL_QUERY"])
+    if not hit:
+        print("No matching CP email found — nothing to do."); return
+    msg_id, fn, data = hit
+
+    state = read_state(drive, os.environ["DRIVE_STATE_FILE_ID"])
+    if state.get("last_msg_id") == msg_id:
+        print(f"Already processed {fn} ({msg_id}); skipping."); return
+
+    label = fn.replace(".xlsb", "").replace("_", " ")
+    agg = aggregate(data, label)
+    write_json(drive, os.environ["DRIVE_AGG_FILE_ID"], agg)
+    write_json(drive, os.environ["DRIVE_STATE_FILE_ID"],
+               {"last_msg_id": msg_id, "file": fn, "open": agg["overall"]["total"]})
+
+    if os.environ.get("SHEET_ID"):
+        sheets = build("sheets", "v4", credentials=c, cache_discovery=False)
+        try:
+            append_trend(sheets, os.environ["SHEET_ID"], agg)
+        except Exception as e:
+            print("Trend append skipped:", e)
+
+    print(f"Updated dashboard from {fn}: {agg['overall']['total']} open shipments.")
+
+if __name__ == "__main__":
     main()
