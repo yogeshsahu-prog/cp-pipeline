@@ -19,10 +19,10 @@ jobs:
       - run: pip install -r requirements.txt
       - run: python cp_pipeline.py
         env:
-          GOOGLE_CLIENT_ID:     ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
-          GMAIL_QUERY:          ${{ secrets.GMAIL_QUERY }}
-          DRIVE_AGG_FILE_ID:    ${{ secrets.DRIVE_AGG_FILE_ID }}
-          DRIVE_STATE_FILE_ID:  ${{ secrets.DRIVE_STATE_FILE_ID }}
-          SHEET_ID:             ${{ secrets.SHEET_ID }}
+          GMAIL_QUERY: ${{ secrets.GMAIL_QUERY }}
+          DRIVE_AGG_FILE_ID: ${{ secrets.DRIVE_AGG_FILE_ID }}
+          DRIVE_STATE_FILE_ID: ${{ secrets.DRIVE_STATE_FILE_ID }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
