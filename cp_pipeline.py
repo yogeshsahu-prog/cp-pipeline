@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 CP Pendency pipeline — Gmail -> parse .xlsb -> aggregate -> Drive agg.json
-DIAGNOSTIC VERSION — prints the query, match count, and every candidate
-message's subject/date so we can see exactly what Gmail is returning.
+Runs headless on GitHub Actions. Authenticates as the user via a stored OAuth
+refresh token (scopes: gmail.readonly + drive). Idempotent: skips if the newest
+matching email hasn't changed since the last run.
 """
 import os, io, json, base64, datetime as dt
 import pandas as pd
@@ -27,7 +28,9 @@ def creds():
     )
 
 def latest_attachment(gmail, query):
-    """Return (msg_id, filename, bytes) for the newest matching xlsb, or None."""
+    """Return (msg_id, filename, bytes) for the newest matching email that has
+    an .xlsb attachment. Some matches (e.g. "Re:" replies) carry no attachment,
+    so we sort all candidates newest-first and take the first one that does."""
     print(f"DEBUG: query received = {query!r}")
     res = gmail.users().messages().list(userId="me", q=query, maxResults=10).execute()
     msgs = res.get("messages", [])
@@ -35,7 +38,7 @@ def latest_attachment(gmail, query):
     if not msgs:
         return None
 
-    best_id, best_ts = None, -1
+    candidates = []
     for m in msgs:
         meta = gmail.users().messages().get(
             userId="me", id=m["id"], format="metadata",
@@ -43,12 +46,8 @@ def latest_attachment(gmail, query):
         ts = int(meta.get("internalDate", 0))
         hdrs = {h["name"]: h["value"] for h in meta.get("payload", {}).get("headers", [])}
         print(f"DEBUG: id={m['id']} ts={ts} subject={hdrs.get('Subject','?')!r} date={hdrs.get('Date','?')!r}")
-        if ts > best_ts:
-            best_ts, best_id = ts, m["id"]
-
-    msg_id = best_id
-    print(f"DEBUG: picked id={msg_id}")
-    full = gmail.users().messages().get(userId="me", id=msg_id, format="full").execute()
+        candidates.append((ts, m["id"]))
+    candidates.sort(key=lambda x: -x[0])   # newest first
 
     def walk(parts):
         for p in parts or []:
@@ -60,14 +59,21 @@ def latest_attachment(gmail, query):
                 return sub
         return None
 
-    hit = walk(full["payload"].get("parts"))
-    if not hit:
-        return None
-    att_id, fn = hit
-    att = gmail.users().messages().attachments().get(
-        userId="me", messageId=msg_id, id=att_id).execute()
-    data = base64.urlsafe_b64decode(att["data"])
-    return msg_id, fn, data
+    for ts, msg_id in candidates:
+        full = gmail.users().messages().get(userId="me", id=msg_id, format="full").execute()
+        hit = walk(full["payload"].get("parts"))
+        if hit:
+            print(f"DEBUG: picked id={msg_id} (has .xlsb)")
+            att_id, fn = hit
+            att = gmail.users().messages().attachments().get(
+                userId="me", messageId=msg_id, id=att_id).execute()
+            data = base64.urlsafe_b64decode(att["data"])
+            return msg_id, fn, data
+        else:
+            print(f"DEBUG: id={msg_id} has no .xlsb attachment, skipping")
+
+    print("DEBUG: no candidate had an .xlsb attachment")
+    return None
 
 def read_state(drive, file_id):
     try:
