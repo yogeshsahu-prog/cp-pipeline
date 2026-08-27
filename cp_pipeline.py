@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
 CP Pendency pipeline — Gmail -> parse .xlsb -> aggregate -> Drive agg.json
-Runs headless on GitHub Actions. Authenticates as the user via a stored OAuth
-refresh token (scopes: gmail.readonly + drive). Idempotent: skips if the newest
-matching email hasn't changed since the last run.
+Reads the raw MIME email to extract the .xlsb, which is more reliable than the
+Gmail API's structured attachment view. Picks the newest email with a valid xlsb.
 """
 import os, io, json, base64, datetime as dt
 import pandas as pd
@@ -28,9 +27,7 @@ def creds():
     )
 
 def latest_attachment(gmail, query):
-    """Return (msg_id, filename, bytes) for the newest matching email whose
-    attachment actually parses as an xlsb. We don't gate on filename — some
-    messages expose it inconsistently — instead we verify by trying to open it."""
+    """Newest matching email whose raw MIME contains a valid .xlsb."""
     print(f"DEBUG: query received = {query!r}")
     res = gmail.users().messages().list(userId="me", q=query, maxResults=10).execute()
     msgs = res.get("messages", [])
@@ -49,32 +46,31 @@ def latest_attachment(gmail, query):
         candidates.append((ts, m["id"]))
     candidates.sort(key=lambda x: -x[0])   # newest first
 
-    def walk(payload):
-        if payload.get("body", {}).get("attachmentId") and payload.get("filename"):
-            return payload["body"]["attachmentId"], payload["filename"]
-        for p in payload.get("parts") or []:
-            sub = walk(p)
-            if sub:
-                return sub
-        return None
-
+    import email
     for ts, msg_id in candidates:
-        full = gmail.users().messages().get(userId="me", id=msg_id, format="full").execute()
-        hit = walk(full["payload"])
-        if hit:
-            att_id, fn = hit
-            att = gmail.users().messages().attachments().get(
-                userId="me", messageId=msg_id, id=att_id).execute()
-            data = base64.urlsafe_b64decode(att["data"])
-            try:
-                pd.ExcelFile(io.BytesIO(data), engine="pyxlsb")  # verify it's a real xlsb
-            except Exception as e:
-                print(f"DEBUG: id={msg_id} attachment {fn!r} isn't a valid xlsb ({e}), skipping")
-                continue
-            print(f"DEBUG: picked id={msg_id} file={fn!r}")
-            return msg_id, fn, data
-        else:
-            print(f"DEBUG: id={msg_id} has no attachment at all, skipping")
+        raw = gmail.users().messages().get(
+            userId="me", id=msg_id, format="raw").execute()
+        raw_bytes = base64.urlsafe_b64decode(raw["raw"])
+        msg = email.message_from_bytes(raw_bytes)
+
+        found = None
+        for part in msg.walk():
+            fn = part.get_filename()
+            if fn and fn.lower().endswith(".xlsb"):
+                found = (fn, part.get_payload(decode=True))
+                break
+        if not found:
+            print(f"DEBUG: id={msg_id} has no .xlsb attachment (raw MIME), skipping")
+            continue
+
+        fn, data = found
+        try:
+            pd.ExcelFile(io.BytesIO(data), engine="pyxlsb")  # verify it's a real xlsb
+        except Exception as e:
+            print(f"DEBUG: id={msg_id} attachment {fn!r} isn't a valid xlsb ({e}), skipping")
+            continue
+        print(f"DEBUG: picked id={msg_id} file={fn!r}")
+        return msg_id, fn, data
 
     print("DEBUG: no candidate had a usable .xlsb attachment")
     return None
