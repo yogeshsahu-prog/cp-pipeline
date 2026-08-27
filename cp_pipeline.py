@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 CP Pendency pipeline — Gmail -> parse .xlsb -> aggregate -> Drive agg.json
-Reads the raw MIME email to extract the .xlsb, which is more reliable than the
-Gmail API's structured attachment view. Picks the newest email with a valid xlsb.
+Searches at THREAD level: the attachment often lives on a sibling message in
+the same thread, not the message the search returned. Picks the newest thread's
+newest message that carries a valid xlsb.
 """
 import os, io, json, base64, datetime as dt
 import pandas as pd
@@ -27,7 +28,7 @@ def creds():
     )
 
 def latest_attachment(gmail, query):
-    """Newest matching email whose raw MIME contains a valid .xlsb."""
+    """Newest thread whose raw MIME contains a valid .xlsb."""
     print(f"DEBUG: query received = {query!r}")
     res = gmail.users().messages().list(userId="me", q=query, maxResults=10).execute()
     msgs = res.get("messages", [])
@@ -47,32 +48,45 @@ def latest_attachment(gmail, query):
     candidates.sort(key=lambda x: -x[0])   # newest first
 
     import email
+    seen_threads = set()
     for ts, msg_id in candidates:
-        raw = gmail.users().messages().get(
-            userId="me", id=msg_id, format="raw").execute()
-        raw_bytes = base64.urlsafe_b64decode(raw["raw"])
-        msg = email.message_from_bytes(raw_bytes)
-
-        found = None
-        for part in msg.walk():
-            fn = part.get_filename()
-            if fn and fn.lower().endswith(".xlsb"):
-                found = (fn, part.get_payload(decode=True))
-                break
-        if not found:
-            print(f"DEBUG: id={msg_id} has no .xlsb attachment (raw MIME), skipping")
+        stub = gmail.users().messages().get(
+            userId="me", id=msg_id, format="minimal").execute()
+        thread_id = stub.get("threadId", msg_id)
+        if thread_id in seen_threads:
             continue
+        seen_threads.add(thread_id)
 
-        fn, data = found
-        try:
-            pd.ExcelFile(io.BytesIO(data), engine="pyxlsb")  # verify it's a real xlsb
-        except Exception as e:
-            print(f"DEBUG: id={msg_id} attachment {fn!r} isn't a valid xlsb ({e}), skipping")
-            continue
-        print(f"DEBUG: picked id={msg_id} file={fn!r}")
-        return msg_id, fn, data
+        thread = gmail.users().threads().get(
+            userId="me", id=thread_id, format="full").execute()
+        tmsgs = sorted(thread.get("messages", []),
+                       key=lambda mm: -int(mm.get("internalDate", 0)))
 
-    print("DEBUG: no candidate had a usable .xlsb attachment")
+        for tm in tmsgs:
+            tm_id = tm["id"]
+            raw = gmail.users().messages().get(
+                userId="me", id=tm_id, format="raw").execute()
+            mime = email.message_from_bytes(base64.urlsafe_b64decode(raw["raw"]))
+            found = None
+            for part in mime.walk():
+                fn = part.get_filename()
+                if fn and fn.lower().endswith(".xlsb"):
+                    found = (fn, part.get_payload(decode=True))
+                    break
+            if not found:
+                continue
+            fn, data = found
+            try:
+                pd.ExcelFile(io.BytesIO(data), engine="pyxlsb")
+            except Exception as e:
+                print(f"DEBUG: thread msg {tm_id} attachment {fn!r} not valid xlsb ({e}), skipping")
+                continue
+            print(f"DEBUG: picked thread={thread_id} msg={tm_id} file={fn!r}")
+            return tm_id, fn, data
+
+        print(f"DEBUG: thread {thread_id} had no usable .xlsb, moving on")
+
+    print("DEBUG: no candidate thread had a usable .xlsb attachment")
     return None
 
 def read_state(drive, file_id):
